@@ -1,0 +1,21 @@
+# Claude Code project brief (internal notes, not part of the public repo)
+CLAUDE.md
+
+# Secrets / credentials
+.env
+.env.*
+*.pem
+*.key
+snowflake_credentials*
+secrets/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS/editor cruft
+.DS_Store
+.vscode/
+.idea/
