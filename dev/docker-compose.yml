@@ -1,0 +1,24 @@
+# Used only to prototype the raw -> staging -> analytics SQL cheaply before
+# running anything against real Snowflake credits.
+#
+# Run:    docker compose -f dev/docker-compose.dev.yml up -d
+# Stop:   docker compose -f dev/docker-compose.dev.yml down
+services:
+  postgres:
+    image: postgres:16
+    container_name: ner-dev-db
+    environment:
+      POSTGRES_USER: NER_USER
+      POSTGRES_PASSWORD: NER_PASSWORD
+      POSTGRES_DB: NER_DB
+    ports:
+      - "5432:5432"
+    # Scripts here run once, in filename order, on first container start.
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: "no"
