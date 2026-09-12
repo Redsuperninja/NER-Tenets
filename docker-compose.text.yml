@@ -1,0 +1,8 @@
+services:
+  etl:
+    build: .
+    image: ner-etl
+    env_file:
+      - .env
+    environment:
+      - DEV_DB_HOST=host.docker.internal

@@ -1,0 +1,12 @@
+etl/data/raw/
+etl/data/processed/
+.env
+CLAUDE.md
+.git/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+dev/

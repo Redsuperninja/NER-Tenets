@@ -6,9 +6,11 @@ CREATE SCHEMA IF NOT EXISTS staging;
 -- bedroom_count = NULL and exist for county-level comparison, not for
 -- joining to leases).
 -- Grain: (county_fips, bedroom_count, source).
-CREATE OR REPLACE VIEW staging.stg_rent_baseline AS
+CREATE TABLE IF NOT EXISTS staging.stg_rent_baseline AS
     WITH hud AS (
         SELECT
+            -- Generates a consistent UUID based on the HUD grain
+            md5(concat('hud_', county_fips, '_', bedroom_count::text, '_', fmr_year::text))::uuid AS stg_rent_baseline_id,
             county_fips,
             county_name,
             bedroom_count,
@@ -16,10 +18,12 @@ CREATE OR REPLACE VIEW staging.stg_rent_baseline AS
             fmr_year      AS data_year,
             source,
             as_of_date
-        FROM raw.hud_fmr_co
+        FROM raw.hud_fmr
     ),
     acs AS (
         SELECT
+            -- Generates a consistent UUID based on the ACS grain (using 'all' for missing bedroom count)
+            md5(concat('acs_', county_fips, '_all_', acs_year::text))::uuid AS stg_rent_baseline_id,
             county_fips,
             county_name,
             NULL::SMALLINT AS bedroom_count,
@@ -27,7 +31,7 @@ CREATE OR REPLACE VIEW staging.stg_rent_baseline AS
             acs_year      AS data_year,
             source,
             as_of_date
-        FROM raw.acs_median_rent_co
+        FROM raw.acs_median_rent
     )
     SELECT * FROM hud
     UNION ALL
@@ -39,9 +43,11 @@ CREATE OR REPLACE VIEW staging.stg_rent_baseline AS
 -- stg_rent_baseline -- ACS rows have no bedroom_count and can't join at
 -- lease grain.
 -- Grain: one row per synthetic lease.
-CREATE OR REPLACE VIEW staging.stg_lease_terms AS
+CREATE TABLE IF NOT EXISTS staging.stg_lease_terms AS
     SELECT
-        l.lease_id,
+        -- Generates a deterministic primary key for the staging table
+        md5(concat('stg_lease_', l.lease_key))::uuid AS stg_lease_term_id,
+        l.lease_key,
         l.county_fips,
         b.county_name,
         l.bedroom_count,
