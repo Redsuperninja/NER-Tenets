@@ -53,3 +53,11 @@ def _parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     run_pipeline(_parse_args().target)
+
+
+#  var extract = Extract()
+# var transform = Transform(extract)
+# Load(transform)
+
+
+# Load(transform(Extract())) 

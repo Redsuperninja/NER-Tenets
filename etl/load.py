@@ -35,6 +35,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 PROCESSED_DATA_DIR = Path(__file__).parent / "data" / "processed"
+STAGING_SQL_PATH = Path(__file__).parent.parent / "dev" / "sql" / "staging.sql"
+ANALYTICS_SQL_PATH = Path(__file__).parent.parent / "dev" / "sql" / "analytics.sql"
 
 # Natural keys used for idempotent upserts/MERGEs, one per raw table.
 HUD_FMR_KEY = ("county_fips", "bedroom_count", "fmr_year")
@@ -123,6 +125,12 @@ def load_to_postgres() -> None:
                               _rows_for_columns(acs_rows, ACS_MEDIAN_RENT_COLUMNS))
             _postgres_upsert(cur, "raw.synthetic_lease_concessions", SYNTHETIC_LEASE_COLUMNS, SYNTHETIC_LEASE_KEY,
                               _rows_for_columns(lease_rows, SYNTHETIC_LEASE_COLUMNS))
+            # rebuild staging tables from dev/sql/staging.sql
+            cur.execute(STAGING_SQL_PATH.read_text())
+            log.info("Rebuilt staging tables from %s", STAGING_SQL_PATH)
+            # analytics views read from staging, so they must be (re)created after staging is rebuilt
+            cur.execute(ANALYTICS_SQL_PATH.read_text())
+            log.info("Rebuilt analytics views from %s", ANALYTICS_SQL_PATH)
     finally:
         conn.close()
 

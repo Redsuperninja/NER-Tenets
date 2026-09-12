@@ -7,7 +7,7 @@ target is Snowflake (see `../sql/`).
 ## 1. Start the DB
 
 ```bash
-./setup-dev.sh
+./script/setup-dev.sh
 ```
 
 Starts the sandbox (`docker compose -f dev/docker-compose.dev.yml up -d`)
@@ -39,7 +39,7 @@ To re-run just the load step without re-hitting the HUD/Census APIs (e.g.
 after tweaking `dev/sql/`):
 
 ```bash
-./run-etl.sh python etl/load.py --target dev
+./script/run-etl.sh python etl/load.py --target dev
 ```
 
 ## 3. Verify the NER logic
