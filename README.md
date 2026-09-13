@@ -1,73 +1,126 @@
-# Dev sandbox (throwaway Postgres)
+# NER Tenets
 
-Prototyping environment for the raw → staging → analytics SQL, kept in the
-repo to show the iteration process. **Not** what's deployed — the real
-target is Snowflake (see `../sql/`).
+ETL pipeline that computes Net Effective Rent (NER) for Colorado counties:
+extracts HUD Fair Market Rent + Census ACS median rent data (plus simulated
+lease concessions, since no public source exists for that), loads it into a
+`raw → staging → analytics` schema, and answers NER queries against it.
 
-## 1. Start the DB
+Two load targets share the same pipeline code and the same schema shape:
 
-```bash
-./script/setup-dev.sh
+- **`dev`** — a throwaway local Postgres sandbox, for iterating on the SQL
+  cheaply before touching real Snowflake credits.
+- **`snowflake`** — the real target.
+
+## Project layout
+
+```
+etl/                  extract.py -> transform.py -> load.py, orchestrated by run_pipeline.py
+  connectors.py        shared Postgres/Snowflake connection helpers
+  run_query.py          runs an ad hoc .sql file against either target, prints results
+sql/                  Snowflake DDL: 00_setup (warehouse/db/schemas) -> 01_raw -> 02_staging -> 03_analytics
+dev/
+  docker-compose.dev.yml   throwaway Postgres sandbox
+  sql/                     dev/Postgres equivalent of sql/ (raw.sql, staging.sql, analytics.sql)
+  sql/queries/             example NER queries, written against analytics.vw_net_effective_rent
+scripts/              thin wrappers around the Docker/pipeline commands below
 ```
 
-Starts the sandbox (`docker compose -f dev/docker-compose.dev.yml up -d`)
-and waits until it's healthy. On first start, everything in `sql/` runs
-once in filename order: raw tables → staging views → analytics view →
-seed data.
-
-## 2. Load it with data
-
-With the sandbox up, run the ETL pipeline (extract → transform → load)
-against it via Docker, so nothing needs installing locally:
+## Setup
 
 ```bash
-cp env.example .env   # fill in HUD_API_TOKEN and CENSUS_API_KEY — Snowflake vars aren't needed for the dev target
-./run-etl.sh
+cp env.example .env
 ```
 
-This builds the `etl` image and runs `docker compose run --rm etl --target
-dev`. `--target dev` points the load step at the sandbox container instead
-of Snowflake. `docker-compose.yml` sets `DEV_DB_HOST=host.docker.internal`
-so the ETL container can reach it on the host; credentials are the
-sandbox's throwaway defaults (`ner_user` / `ner_db`) either way.
+Fill in:
+- `HUD_API_TOKEN` / `CENSUS_API_KEY` — needed for extract, regardless of target.
+- `SNOWFLAKE_ACCOUNT` / `SNOWFLAKE_USER` / `SNOWFLAKE_PAT` — only needed for
+  the `snowflake` target. `SNOWFLAKE_PAT` is a **Programmatic Access Token**
+  (Snowsight → user menu → Profile → Programmatic access tokens), not your
+  login password — `load.py` authenticates with
+  `authenticator=PROGRAMMATIC_ACCESS_TOKEN`.
 
-The load step upserts on each table's natural key —
-`(county_fips, bedroom_count, fmr_year)`, `(county_fips, acs_year)`,
-`lease_key` — so rerunning the pipeline is safe and won't duplicate rows.
+Everything runs inside Docker (`docker-compose.yml` builds the `etl` image),
+so nothing needs installing locally beyond Docker itself.
 
-To re-run just the load step without re-hitting the HUD/Census APIs (e.g.
-after tweaking `dev/sql/`):
+## Running the pipeline end to end
 
 ```bash
-./script/run-etl.sh python etl/load.py --target dev
+./scripts/run-pipeline-dev.sh          # dev Postgres sandbox
+./scripts/run-pipeline-snowflake.sh    # real Snowflake
 ```
 
-## 3. Verify the NER logic
+Each script starts/prepares its target, then runs extract → transform →
+load. The Snowflake variant also runs the one-time `sql/00_setup.sql`
+(warehouse/database/schema creation, safe to rerun) via `snowsql` first, if
+it's installed.
+
+Under the hood both call `./scripts/run-etl.sh --target <dev|snowflake>`,
+which builds the `etl` image and runs
+`docker compose run --rm etl --target <target>`. That in turn runs
+`etl/run_pipeline.py`, which:
+
+1. **extract** — pulls HUD FMR + ACS data, writes JSON to `etl/data/raw/`.
+2. **transform** — cleans it into `raw.hud_fmr` / `raw.acs_median_rent`
+   shapes and generates the synthetic lease concessions table.
+3. **load** — ensures raw tables exist (`sql/01_raw.sql` /
+   `dev/sql/raw.sql`), upserts/merges rows on each table's natural key
+   (`(county_fips, bedroom_count, fmr_year)`, `(county_fips, acs_year)`,
+   `lease_key`), then rebuilds staging + analytics from
+   `sql/02_staging.sql` + `sql/03_analytics.sql` (or the `dev/sql/`
+   equivalents).
+
+Reruns never duplicate rows, so the whole pipeline is safe to run repeatedly.
+
+To re-run just the load step without re-hitting the HUD/Census APIs:
 
 ```bash
+./scripts/run-etl.sh python etl/load.py --target dev
+./scripts/run-etl.sh python etl/load.py --target snowflake
+```
+
+## Querying results
+
+`dev/sql/queries/` has example NER queries (by value, by percent, by county,
+etc.), all written against `analytics.vw_net_effective_rent`. That view has
+the identical shape in both targets, so the same query file runs unmodified
+against either one:
+
+```bash
+./scripts/run-query.sh dev/sql/queries/NER_BY_VALUE.sql --target snowflake
+./scripts/run-query.sh dev/sql/queries/NER_BY_VALUE.sql --target dev
+```
+
+This runs `etl/run_query.py` in the same Docker image/credentials as the
+pipeline and prints the results as a plain table.
+
+**Current state / automation TODO:** getting new query files into Snowflake
+today just means running `run-query.sh` against them by hand as they're
+written — there's no scheduled or CI-triggered run. If these queries need to
+run on a schedule (a daily NER report, say) or get exposed somewhere besides
+a terminal, that's a natural next step: either add a `--output csv/json`
+mode to `run_query.py` and drop that into a cron/GitHub Actions job, or wire
+the query set into `run_pipeline.py` so a pipeline run also regenerates a
+fixed set of reports.
+
+## Verifying the dev sandbox directly
+
+```bash
+./scripts/setup-dev.sh
 docker exec -it ner-dev-db psql -U ner_user -d ner_db \
   -c "SELECT * FROM analytics.vw_net_effective_rent ORDER BY county_name, bedroom_count;"
+./scripts/teardown-dev.sh   # wipes it -- no volume is defined, that's intentional
 ```
 
-You should see 5 rows (Denver x2, Boulder, El Paso, Larimer), each with
-`net_effective_rent` ≤ `gross_rent`, and El Paso (no concessions) showing
-`ner_discount_pct = 0`.
+## Porting dev SQL to Snowflake
 
-## 4. Tear down
-
-```bash
-docker compose -f dev/docker-compose.dev.yml down
-```
-
-No volume is defined, so this wipes all data — that's intentional; it's a
-throwaway sandbox, not a persistent database.
-
-## Porting to Snowflake
+`dev/sql/` is a prototyping ground for the `sql/` files, not a second
+maintained copy — when changing the schema, edit both, mirroring the
+differences below:
 
 - `CREATE SCHEMA` / `TABLE` / `VIEW` syntax carries over almost as-is. Main
-  differences: Snowflake-specific types (`NUMBER` vs `NUMERIC`) and
+  differences: Snowflake-specific types (`NUMBER`/`VARCHAR` vs
+  `NUMERIC`/`TEXT`), `UUID_STRING()` vs Postgres's `gen_random_uuid()`, and
   warehouse/database context statements (`USE WAREHOUSE`, `USE DATABASE`)
   that Postgres has no equivalent for.
-- `SERIAL` (Postgres auto-increment) becomes `IDENTITY` in Snowflake.
 - Real `raw.*` tables in Snowflake are loaded by the ETL pipeline
-  (`../etl/`), not manually seeded like `04_seed_sample_data.sql` here.
+  (`etl/load.py`), not manually seeded.

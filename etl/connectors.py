@@ -49,12 +49,6 @@ def snowflake_connect():
 
 
 def snowflake_execute_sql_file(cur, path: Path) -> None:
-    # Snowflake's connector runs one statement per execute() call, so a
-    # multi-statement .sql file has to be split and run statement by
-    # statement (cur.execute_string() also works, but this keeps logging
-    # per-statement for easier debugging). Strip "--" line comments first --
-    # a semicolon inside a comment (e.g. explanatory prose) would otherwise
-    # split a statement in the wrong place.
     without_comments = "\n".join(
         line.split("--", 1)[0] for line in path.read_text().splitlines()
     )
