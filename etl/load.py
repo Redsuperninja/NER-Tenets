@@ -6,12 +6,16 @@ Supports two targets so the load logic can be proven cheaply before it
 touches real Snowflake credits:
   - "dev"       -> the disposable Postgres sandbox (dev/docker-compose.dev.yml,
                    schema from dev/sql/raw.sql)
-  - "snowflake" -> the real Snowflake raw schema (sql/01_raw_ddl.sql)
+  - "snowflake" -> the real Snowflake raw schema (sql/01_raw.sql)
 
 Both paths upsert on the same natural keys so reruns never duplicate rows:
   - raw.hud_fmr                   : (county_fips, bedroom_count, fmr_year)
   - raw.acs_median_rent           : (county_fips, acs_year)
   - raw.synthetic_lease_concessions : (lease_key) -- see transform.py
+
+Both paths also rebuild staging + analytics after loading raw, from the
+matching SQL for that target (dev/sql/*.sql for Postgres, sql/0{2,3}_*.sql
+for Snowflake)
 
 Run directly:
     python etl/load.py --target dev
@@ -25,9 +29,15 @@ import argparse
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from etl.connectors import postgres_connect, snowflake_connect, snowflake_execute_sql_file
 
 load_dotenv()
 
@@ -35,8 +45,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 PROCESSED_DATA_DIR = Path(__file__).parent / "data" / "processed"
-STAGING_SQL_PATH = Path(__file__).parent.parent / "dev" / "sql" / "staging.sql"
-ANALYTICS_SQL_PATH = Path(__file__).parent.parent / "dev" / "sql" / "analytics.sql"
+
+# Dev (Postgres) raw/staging/analytics rebuild SQL.
+DEV_RAW_SQL_PATH = Path(__file__).parent.parent / "dev" / "sql" / "raw.sql"
+DEV_STAGING_SQL_PATH = Path(__file__).parent.parent / "dev" / "sql" / "staging.sql"
+DEV_ANALYTICS_SQL_PATH = Path(__file__).parent.parent / "dev" / "sql" / "analytics.sql"
+
+# Snowflake raw/staging/analytics rebuild SQL.
+SNOWFLAKE_RAW_SQL_PATH = Path(__file__).parent.parent / "sql" / "01_raw.sql"
+SNOWFLAKE_STAGING_SQL_PATH = Path(__file__).parent.parent / "sql" / "02_staging.sql"
+SNOWFLAKE_ANALYTICS_SQL_PATH = Path(__file__).parent.parent / "sql" / "03_analytics.sql"
 
 # Natural keys used for idempotent upserts/MERGEs, one per raw table.
 HUD_FMR_KEY = ("county_fips", "bedroom_count", "fmr_year")
@@ -59,13 +77,6 @@ SYNTHETIC_LEASE_COLUMNS = [
 ]
 
 
-def _require_env(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise RuntimeError(f"{name} is not set. Copy .env.example to .env and fill it in.")
-    return value
-
-
 def _read_processed(filename: str) -> list[dict]:
     path = PROCESSED_DATA_DIR / filename
     if not path.exists():
@@ -80,20 +91,6 @@ def _rows_for_columns(rows: list[dict], columns: list[str]) -> list[tuple]:
 # ---------------------------------------------------------------------------
 # Dev sandbox (Postgres)
 # ---------------------------------------------------------------------------
-
-def _postgres_connect():
-    import psycopg2
-
-    # Matches the throwaway credentials hardcoded in
-    # dev/docker-compose.dev.yml -- local-only, fine to default here.
-    return psycopg2.connect(
-        host=os.environ.get("DEV_DB_HOST", "localhost"),
-        port=os.environ.get("DEV_DB_PORT", "5432"),
-        dbname=os.environ.get("DEV_DB_NAME", "ner_db"),
-        user=os.environ.get("DEV_DB_USER", "ner_user"),
-        password=os.environ.get("DEV_DB_PASSWORD", "ner_password"),
-    )
-
 
 def _postgres_upsert(cur, table: str, columns: list[str], key: tuple[str, ...], rows: list[tuple]) -> None:
     if not rows:
@@ -116,9 +113,12 @@ def load_to_postgres() -> None:
     acs_rows = _read_processed("acs_median_rent.json")
     lease_rows = _read_processed("synthetic_lease_concessions.json")
 
-    conn = _postgres_connect()
+    conn = postgres_connect()
     try:
         with conn, conn.cursor() as cur:
+            # ensure raw tables exist before upserting into them
+            cur.execute(DEV_RAW_SQL_PATH.read_text())
+            log.info("Ensured raw tables exist from %s", DEV_RAW_SQL_PATH)
             _postgres_upsert(cur, "raw.hud_fmr", HUD_FMR_COLUMNS, HUD_FMR_KEY,
                               _rows_for_columns(hud_rows, HUD_FMR_COLUMNS))
             _postgres_upsert(cur, "raw.acs_median_rent", ACS_MEDIAN_RENT_COLUMNS, ACS_MEDIAN_RENT_KEY,
@@ -126,11 +126,11 @@ def load_to_postgres() -> None:
             _postgres_upsert(cur, "raw.synthetic_lease_concessions", SYNTHETIC_LEASE_COLUMNS, SYNTHETIC_LEASE_KEY,
                               _rows_for_columns(lease_rows, SYNTHETIC_LEASE_COLUMNS))
             # rebuild staging tables from dev/sql/staging.sql
-            cur.execute(STAGING_SQL_PATH.read_text())
-            log.info("Rebuilt staging tables from %s", STAGING_SQL_PATH)
+            cur.execute(DEV_STAGING_SQL_PATH.read_text())
+            log.info("Rebuilt staging tables from %s", DEV_STAGING_SQL_PATH)
             # analytics views read from staging, so they must be (re)created after staging is rebuilt
-            cur.execute(ANALYTICS_SQL_PATH.read_text())
-            log.info("Rebuilt analytics views from %s", ANALYTICS_SQL_PATH)
+            cur.execute(DEV_ANALYTICS_SQL_PATH.read_text())
+            log.info("Rebuilt analytics views from %s", DEV_ANALYTICS_SQL_PATH)
     finally:
         conn.close()
 
@@ -138,20 +138,6 @@ def load_to_postgres() -> None:
 # ---------------------------------------------------------------------------
 # Snowflake
 # ---------------------------------------------------------------------------
-
-def _snowflake_connect():
-    import snowflake.connector
-
-    return snowflake.connector.connect(
-        account=_require_env("SNOWFLAKE_ACCOUNT"),
-        user=_require_env("SNOWFLAKE_USER"),
-        password=_require_env("SNOWFLAKE_PASSWORD"),
-        warehouse=os.environ.get("SNOWFLAKE_WAREHOUSE", "NER_DEMO_WH"),
-        database=os.environ.get("SNOWFLAKE_DATABASE", "NER_DEMO"),
-        role=os.environ.get("SNOWFLAKE_ROLE") or None,
-        schema="RAW",
-    )
-
 
 def _snowflake_merge(cur, table: str, columns: list[str], key: tuple[str, ...], rows: list[tuple]) -> None:
     if not rows:
@@ -192,16 +178,25 @@ def load_to_snowflake() -> None:
     acs_rows = _read_processed("acs_median_rent.json")
     lease_rows = _read_processed("synthetic_lease_concessions.json")
 
-    conn = _snowflake_connect()
+    conn = snowflake_connect()
     try:
         cur = conn.cursor()
         try:
+            # ensure raw tables exist before merging into them
+            snowflake_execute_sql_file(cur, SNOWFLAKE_RAW_SQL_PATH)
+            log.info("Ensured raw tables exist from %s", SNOWFLAKE_RAW_SQL_PATH)
             _snowflake_merge(cur, "raw.hud_fmr", HUD_FMR_COLUMNS, HUD_FMR_KEY,
                               _rows_for_columns(hud_rows, HUD_FMR_COLUMNS))
             _snowflake_merge(cur, "raw.acs_median_rent", ACS_MEDIAN_RENT_COLUMNS, ACS_MEDIAN_RENT_KEY,
                               _rows_for_columns(acs_rows, ACS_MEDIAN_RENT_COLUMNS))
             _snowflake_merge(cur, "raw.synthetic_lease_concessions", SYNTHETIC_LEASE_COLUMNS, SYNTHETIC_LEASE_KEY,
                               _rows_for_columns(lease_rows, SYNTHETIC_LEASE_COLUMNS))
+            # rebuild staging tables from sql/02_staging_ddl.sql
+            snowflake_execute_sql_file(cur, SNOWFLAKE_STAGING_SQL_PATH)
+            log.info("Rebuilt staging tables from %s", SNOWFLAKE_STAGING_SQL_PATH)
+            # analytics views read from staging, so they must be (re)created after staging is rebuilt
+            snowflake_execute_sql_file(cur, SNOWFLAKE_ANALYTICS_SQL_PATH)
+            log.info("Rebuilt analytics views from %s", SNOWFLAKE_ANALYTICS_SQL_PATH)
             conn.commit()
         finally:
             cur.close()

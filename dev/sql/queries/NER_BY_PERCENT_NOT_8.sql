@@ -22,4 +22,5 @@ WITH net_effective_rent AS (
         FROM analytics.vw_net_effective_rent
 ) 
 SELECT * FROM net_effective_rent
+WHERE ner_discount_pct BETWEEN 0 AND 8.5
 ORDER BY ner_discount_pct ASC, net_effective_rent DESC;
