@@ -1,8 +1,5 @@
 SELECT
-    lease_key,
-    county_fips,
     county_name,
-    bedroom_count,
     gross_rent,
     lease_term_months,
     free_rent_months,

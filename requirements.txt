@@ -1,4 +1,4 @@
 requests==2.32.3
 python-dotenv==1.0.1
 psycopg2-binary==2.9.9
-snowflake-connector-python==3.12.3
+snowflake-connector-python==3.13.2
